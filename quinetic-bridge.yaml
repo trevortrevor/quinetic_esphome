@@ -1,0 +1,190 @@
+esphome:
+  name: quinetic-bridge
+  includes:
+    - quinetic.h
+  on_boot:
+    priority: -100
+    then:
+      - lambda: "quinetic.setup();"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    advanced:
+      minimum_chip_revision: "3.0"
+
+logger:
+  level: DEBUG
+
+ota:
+  - platform: esphome
+    encryption:
+      key: !secret ota_encryption_key
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  actions:
+    - action: transmit_quinetic
+      variables:
+        switch_id: int
+        action: int
+      then:
+        - script.execute:
+            id: send_quinetic_command
+            switch_id: !lambda "return switch_id;"
+            action: !lambda "return action;"
+
+mqtt:
+  broker: !secret mqtt_broker
+  username: !secret mqtt_user
+  password: !secret mqtt_pass
+
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+  miso_pin: GPIO19
+
+cc1101:
+  id: cc1101_rf
+  cs_pin: GPIO17
+  gdo0_pin: GPIO16
+  frequency: 433.30MHz
+  modulation_type: 2-FSK
+  symbol_rate: 100000
+  fsk_deviation: 50kHz
+  filter_bandwidth: 325kHz
+  packet_mode: true
+  packet_length: 5
+  sync_mode: 16/16
+  sync1: 0xA4
+  sync0: 0x23
+  crc_enable: false
+  num_preamble: 4
+  output_power: 10
+
+  on_packet:
+    then:
+      - lambda: |-
+          uint16_t switch_id = 0;
+          uint8_t action = 0;
+          bool is_release = false;
+          bool just_learned = false;
+
+          if (quinetic.process_packet(x, switch_id, action, is_release, just_learned)) {
+            char id_str[10];
+            snprintf(id_str, sizeof(id_str), "0x%04X", switch_id);
+
+            // 1. If 5 clicks occurred: Register the switch in Home Assistant
+            if (just_learned) {
+              ESP_LOGW("quinetic", ">>> NEW SWITCH LEARNED & REGISTERED: %s <<<", id_str);
+              id(register_ha_entities).execute(switch_id);
+              id(learned_switch_id).publish_state(id_str);
+            }
+
+            // 2. Publish press or release for any learned switch
+            if (quinetic.is_learned(switch_id)) {
+              ESP_LOGI("quinetic", "Switch %s: %s (Action: 0x%02X)",
+                       id_str, is_release ? "RELEASE" : "PRESS", action);
+              id(publish_switch_event).execute(switch_id, is_release ? 1 : 0);
+            }
+          }
+
+script:
+  # Publishes Home Assistant MQTT Discovery for an EVENT entity
+  - id: register_ha_entities
+    mode: queued
+    parameters:
+      switch_id: int
+    then:
+      # Step A: Clean up any previous 'button' discovery topic
+      - mqtt.publish:
+          topic: !lambda |-
+            char t[80];
+            snprintf(t, sizeof(t), "homeassistant/button/quinetic_%04x/config", switch_id);
+            return std::string(t);
+          payload: ""
+          retain: true
+
+      # Step B: Register the EVENT entity (supporting press and release)
+      - mqtt.publish:
+          topic: !lambda |-
+            char t[80];
+            snprintf(t, sizeof(t), "homeassistant/event/quinetic_%04x/config", switch_id);
+            return std::string(t);
+          payload: !lambda |-
+            char p[450];
+            snprintf(p, sizeof(p),
+              "{\"name\":\"Quinetic 0x%04X\","
+              "\"unique_id\":\"quinetic_evt_%04x\","
+              "\"state_topic\":\"quinetic/switch/0x%04X/event\","
+              "\"event_types\":[\"press\",\"release\"],"
+              "\"device_class\":\"button\","
+              "\"device\":{"
+                "\"identifiers\":[\"quinetic_cc1101_bridge\"],"
+                "\"name\":\"Quinetic Bridge\","
+                "\"model\":\"ESP32 CC1101\""
+              "}}",
+              switch_id, switch_id, switch_id);
+            return std::string(p);
+          retain: true
+
+  # Publishes incoming physical events to Home Assistant
+  - id: publish_switch_event
+    mode: queued
+    parameters:
+      switch_id: int
+      is_release: int
+    then:
+      # 1. Fires the Home Assistant Event entity
+      - mqtt.publish:
+          topic: !lambda |-
+            char t[64];
+            snprintf(t, sizeof(t), "quinetic/switch/0x%04X/event", switch_id);
+            return std::string(t);
+          payload: !lambda |-
+            return (is_release == 1) ? "{\"event_type\":\"release\"}" : "{\"event_type\":\"press\"}";
+
+      # 2. General MQTT topic for all switches
+      - mqtt.publish:
+          topic: "quinetic/events"
+          payload: !lambda |-
+            char p[96];
+            snprintf(p, sizeof(p), "{\"id\":\"0x%04X\",\"event\":\"%s\"}",
+                     switch_id, (is_release == 1) ? "release" : "press");
+            return std::string(p);
+
+  # CC1101 Transmit routine (emulates 4-packet Quinetic kinetic burst)
+  - id: send_quinetic_command
+    mode: restart
+    parameters:
+      switch_id: int
+      action: int
+    then:
+      - repeat:
+          count: 4
+          then:
+            - cc1101.send_packet:
+                id: cc1101_rf
+                data: !lambda |-
+                  uint8_t id_hi = (switch_id >> 8) & 0xFF;
+                  uint8_t id_lo = switch_id & 0xFF;
+                  uint8_t act = action & 0xFF;
+                  uint8_t payload[3] = {id_hi, id_lo, act};
+                  uint16_t crc = quinetic_crc16(payload, 3);
+                  return std::vector<uint8_t>{
+                    id_hi, id_lo, act,
+                    (uint8_t)(crc >> 8),
+                    (uint8_t)(crc & 0xFF)
+                  };
+            - delay: 15ms
+
+text_sensor:
+  - platform: template
+    name: "Quinetic Newly Learned Switch"
+    id: learned_switch_id
