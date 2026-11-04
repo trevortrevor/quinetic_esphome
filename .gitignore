@@ -1,0 +1,15 @@
+# ESPHome compilation artifacts
+.esphome/
+*.bin
+*.elf
+
+# Sensitive configuration
+secrets.yaml
+
+# Operating System & IDE metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.bak
